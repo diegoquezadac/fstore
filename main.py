@@ -44,6 +44,8 @@ def main():
     user_total_spent = Feature("total_spent",         user,  "sum",     on="price")
     user_tx_count    = Feature("tx_count",            user,  "count")
     user_cards_2d    = Feature("distinct_cards_2d",   user,  "nunique", on="card", window="2d")
+    user_tx_store10  = Feature("tx_count_store10",    user,  "count",
+                               where=lambda g: g["store_id"] == 10)
 
     store_avg_price  = Feature("avg_price",           store, "mean",    on="price")
     store_total_rev  = Feature("total_revenue",        store, "sum",     on="price")
@@ -57,7 +59,7 @@ def main():
 
     fs = FeatureStore(timestamp_col="ts")
     for f in [user_avg_price, user_total_spent, user_tx_count, user_cards_2d,
-              store_avg_price, store_total_rev]:
+              user_tx_store10, store_avg_price, store_total_rev]:
         fs.register(f)
 
     results = fs.run(df, id_col="attempt_id")
