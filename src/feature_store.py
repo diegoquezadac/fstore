@@ -84,7 +84,14 @@ class FeatureStore:
     # Batch API
     # ------------------------------------------------------------------
 
-    def run(self, df: pd.DataFrame, verbose: bool = False, log_every: int = 100) -> dict[str, Any]:
+    def run(
+        self,
+        df: pd.DataFrame,
+        verbose: bool = False,
+        log_every: int = 100,
+        checkpoint_dir: str | None = None,
+        checkpoint_every: int = 100_000,
+    ) -> dict[str, Any]:
         """Process a full DataFrame in timestamp order (experimental mode).
 
         Modifies *df* in place by adding feature values as new columns named
@@ -97,12 +104,22 @@ class FeatureStore:
             verbose: Emit detailed per-phase timing logs (INFO level).
                      Enable with ``logging.basicConfig(level=logging.INFO)``.
             log_every: Progress log interval in rows (default 100).
+            checkpoint_dir: Directory for crash-recovery checkpoints saved
+                during the slow (row-by-row) path. Pass the same path on a
+                re-run to resume automatically. Deleted on success.
+            checkpoint_every: Rows between checkpoint writes (default 100 000).
 
         Returns:
             A summary report dict: rows_processed, features_computed,
             records_written, elapsed_seconds, feature_columns.
         """
-        return self._engine.run(df, verbose=verbose, log_every=log_every)
+        return self._engine.run(
+            df,
+            verbose=verbose,
+            log_every=log_every,
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_every=checkpoint_every,
+        )
 
     # ------------------------------------------------------------------
     # Serving

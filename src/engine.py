@@ -5,6 +5,9 @@ aggregations, batch execution, and both online (latest) and offline
 (historical) feature serving.
 """
 
+import json
+import os
+import shutil
 import time
 import logging
 import numpy as np
@@ -134,7 +137,14 @@ class Engine:
     # Batch API
     # ------------------------------------------------------------------
 
-    def run(self, df: pd.DataFrame, verbose: bool = False, log_every: int = 100) -> dict[str, Any]:
+    def run(
+        self,
+        df: pd.DataFrame,
+        verbose: bool = False,
+        log_every: int = 100,
+        checkpoint_dir: str | None = None,
+        checkpoint_every: int = 100_000,
+    ) -> dict[str, Any]:
         """Process a full DataFrame in timestamp order, adding computed features
         as new columns directly on *df*.
 
@@ -155,6 +165,15 @@ class Engine:
                      to see them. Defaults to False.
             log_every: How often (in rows) to emit a progress log when
                        verbose=True. Defaults to 100.
+            checkpoint_dir: Directory to store checkpoint files.  When set,
+                the slow path saves its progress every ``checkpoint_every``
+                rows so a failed run can resume without restarting from row 0.
+                If a valid checkpoint is found at startup the run resumes
+                automatically; on successful completion the directory is
+                removed.  The fast (vectorised) path always reruns from
+                scratch — it typically takes only seconds.
+            checkpoint_every: How often (in rows) to write a checkpoint
+                during the slow path. Defaults to 100 000.
 
         Returns:
             A summary report with execution statistics.
@@ -171,6 +190,11 @@ class Engine:
 
         feat_items = list(self._features.items())
         col_names  = {fk: f"{feat.entity.name}__{feat.name}" for fk, feat in feat_items}
+
+        # Checkpoint paths (resolved once; None when checkpointing is disabled).
+        _ckpt_meta   = os.path.join(checkpoint_dir, "meta.json")           if checkpoint_dir else None
+        _ckpt_values = os.path.join(checkpoint_dir, "slow_values.parquet") if checkpoint_dir else None
+        resume_slow_row = 0
 
         # Split features into two paths:
         #   fast — vectorised pandas ops over the whole df at once (no Python loop)
@@ -192,6 +216,31 @@ class Engine:
 
         # feature_values: col_name -> numpy array (fast) or list (slow)
         feature_values: dict[str, Any] = {}
+
+        # Load slow-path values saved by a prior run that was interrupted.
+        if _ckpt_meta and os.path.exists(_ckpt_meta):
+            with open(_ckpt_meta) as _f:
+                _meta = json.load(_f)
+            if _meta.get("n_rows") == n_rows:
+                resume_slow_row = _meta.get("slow_row", 0)
+                if resume_slow_row > 0 and _ckpt_values and os.path.exists(_ckpt_values):
+                    _ckpt_df = pd.read_parquet(_ckpt_values)
+                    for _col in _ckpt_df.columns:
+                        # Restore computed rows; pad the rest with None.
+                        feature_values[_col] = (
+                            _ckpt_df[_col].tolist()
+                            + [None] * (n_rows - resume_slow_row)
+                        )
+                logger.info(
+                    "[run] Resuming from checkpoint — slow row %d/%d",
+                    resume_slow_row, n_rows,
+                )
+            else:
+                logger.warning(
+                    "[run] Checkpoint n_rows mismatch (%d vs %d) — starting fresh",
+                    _meta.get("n_rows"), n_rows,
+                )
+                resume_slow_row = 0
 
         _BATCH_SIZE = 100_000
         records: list[FeatureRecord] = []
@@ -302,9 +351,10 @@ class Engine:
                 for fk, feat in slow_feats
             }
             for fk, feat in slow_feats:
-                feature_values[col_names[fk]] = [None] * n_rows
+                if col_names[fk] not in feature_values:  # may be pre-loaded from checkpoint
+                    feature_values[col_names[fk]] = [None] * n_rows
 
-            for i, row in df.iterrows():
+            for i, row in df.iloc[resume_slow_row:].iterrows():
                 timestamp = row[self.timestamp_col]
 
                 for feat_key, feature in slow_feats:
@@ -372,6 +422,18 @@ class Engine:
                     total_records_written += len(records)
                     records.clear()
 
+                if _ckpt_meta and (i + 1) % checkpoint_every == 0:
+                    os.makedirs(checkpoint_dir, exist_ok=True)  # type: ignore[arg-type]
+                    _slow_cols = {
+                        col_names[fk]: feature_values[col_names[fk]][: i + 1]
+                        for fk, _ in slow_feats
+                    }
+                    pd.DataFrame(_slow_cols).to_parquet(_ckpt_values, index=False)
+                    with open(_ckpt_meta, "w") as _f:
+                        json.dump({"n_rows": n_rows, "slow_row": i + 1}, _f)
+                    if verbose:
+                        logger.info("[run] Checkpoint saved at row %d/%d", i + 1, n_rows)
+
                 if verbose and (i + 1) % log_every == 0:
                     elapsed = time.perf_counter() - start
                     logger.info(
@@ -388,6 +450,11 @@ class Engine:
         if records:
             _flush(records)
             total_records_written += len(records)
+
+        if checkpoint_dir and os.path.exists(checkpoint_dir):
+            shutil.rmtree(checkpoint_dir)
+            if verbose:
+                logger.info("[run] Checkpoint removed — run completed successfully")
 
         elapsed = time.perf_counter() - start
 
