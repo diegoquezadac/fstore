@@ -494,20 +494,20 @@ class FeatureEngine:
         if feature.where is not None:
             mask = feature.where(df)
             if agg == "count":
-                return mask.astype(int).groupby(df[ek]).cumsum().to_numpy()
+                return mask.astype(int).groupby(df[ek], dropna=False).cumsum().to_numpy()
             else:
                 data = df[on].where(mask, other=np.nan)
-                result = getattr(data.groupby(df[ek]).expanding(), agg)()
+                result = getattr(data.groupby(df[ek], dropna=False).expanding(), agg)()
                 return result.droplevel(0).sort_index().to_numpy()
 
         if agg == "nunique":
             is_first = (~df.duplicated(subset=[ek, on], keep="first")).astype(int)
-            return is_first.groupby(df[ek]).cumsum().to_numpy()
+            return is_first.groupby(df[ek], dropna=False).cumsum().to_numpy()
 
         if agg == "count":
-            return (df.groupby(ek).cumcount() + 1).to_numpy()
+            return (df.groupby(ek, dropna=False).cumcount() + 1).to_numpy()
 
-        result = getattr(df.groupby(ek)[on].expanding(), agg)()
+        result = getattr(df.groupby(ek, dropna=False)[on].expanding(), agg)()
         return result.droplevel(0).sort_index().to_numpy()
 
     # ------------------------------------------------------------------
