@@ -418,9 +418,14 @@ class FeatureEngine:
             groups: dict[str, dict[Any, tuple[pd.DatetimeIndex, dict[str, np.ndarray]]]] = {}
             for key_col in slow_key_cols:
                 groups[key_col] = {}
-                for key_val, grp in df.groupby(key_col, sort=False):
+                for key_val, grp in df.groupby(key_col, sort=False, dropna=False):
                     if hasattr(key_val, "item"):
                         key_val = key_val.item()
+                    try:
+                        if pd.isna(key_val):
+                            key_val = None
+                    except (TypeError, ValueError):
+                        pass
                     groups[key_col][key_val] = (
                         pd.DatetimeIndex(grp[self.timestamp_col]),
                         {col: grp[col].to_numpy() for col in input_cols},
@@ -450,6 +455,11 @@ class FeatureEngine:
                     entity_key = row[entity.key]
                     if hasattr(entity_key, "item"):
                         entity_key = entity_key.item()
+                    try:
+                        if pd.isna(entity_key):
+                            entity_key = None
+                    except (TypeError, ValueError):
+                        pass
 
                     ts_idx, arrays = groups[entity.key][entity_key]
 
