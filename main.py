@@ -38,7 +38,7 @@ def main():
     store = Entity("store", "store_id")
 
     # ---------------------------------------------------------------
-    # Define features  (some with time windows)
+    # Define features  (some with time windows / filters)
     # ---------------------------------------------------------------
     user_avg_price   = Feature("avg_price",          user,  "mean",    on="price")
     user_total_spent = Feature("total_spent",         user,  "sum",     on="price")
@@ -51,10 +51,13 @@ def main():
     store_total_rev  = Feature("total_revenue",        store, "sum",     on="price")
 
     # ---------------------------------------------------------------
-    # Example 1: run() — batch processing, one shot
+    # Example 1: run() — experimental mode
+    #   - Modifies df in place, adding feature columns
+    #   - Writes all offline records in a single batch
+    #   - Returns a summary report
     # ---------------------------------------------------------------
     print("=" * 60)
-    print("EXAMPLE 1 — run(df, id_col=...)")
+    print("EXAMPLE 1 — run(df)  — experimental mode")
     print("=" * 60)
 
     fs = FeatureStore(timestamp_col="ts")
@@ -62,11 +65,12 @@ def main():
               user_tx_store10, store_avg_price, store_total_rev]:
         fs.register(f)
 
-    results = fs.run(df, id_col="attempt_id")
-    for attempt_id, entity_features in results.items():
-        print(f"\n  attempt_id={attempt_id}")
-        for entity_name, feats in entity_features.items():
-            print(f"    {entity_name}: {feats}")
+    report = fs.run(df)
+    print("\nReport:", report)
+
+    print("\nDataFrame with feature columns:")
+    feature_cols = ["attempt_id", "user_id", "store_id", "ts"] + report["feature_columns"]
+    print(df[feature_cols].to_string(index=False))
 
     print("\n--- Online features after run() ---")
     print(f"  User 1:   {fs.get_online_features('user', user_id=1)}")
@@ -78,10 +82,12 @@ def main():
         print(f"  {rec.timestamp.date()}: avg_price = {rec.value:.2f}")
 
     # ---------------------------------------------------------------
-    # Example 2: step() — process one row at a time (streaming)
+    # Example 2: step() — streaming mode
+    #   - Processes one row at a time (buffer grows with each call)
+    #   - Returns updated features for each row as it arrives
     # ---------------------------------------------------------------
     print("\n" + "=" * 60)
-    print("EXAMPLE 2 — step(row)  — streaming / real-time")
+    print("EXAMPLE 2 — step(row)  — streaming mode")
     print("=" * 60)
 
     if os.path.exists("offline.parquet"):
@@ -96,24 +102,6 @@ def main():
         features = fs2.step(row)
         print(f"  attempt {int(row['attempt_id'])} "
               f"(user {int(row['user_id'])}, ts={row['ts'].date()}) → {features}")
-
-    # ---------------------------------------------------------------
-    # Example 3: run() without id_col — uses DataFrame index
-    # ---------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("EXAMPLE 3 — run(df)  — no id_col, keyed by index")
-    print("=" * 60)
-
-    if os.path.exists("offline.parquet"):
-        os.remove("offline.parquet")
-
-    fs3 = FeatureStore(timestamp_col="ts")
-    for f in [user_avg_price, user_tx_count]:
-        fs3.register(f)
-
-    results3 = fs3.run(df)
-    for idx, entity_features in results3.items():
-        print(f"  row {idx}: {entity_features}")
 
 
 if __name__ == "__main__":
