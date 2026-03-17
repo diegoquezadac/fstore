@@ -1,0 +1,10 @@
+[project]
+name = "fs"
+version = "0.1.0"
+description = "A minimal local feature store for offline and online feature serving"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.0",
+    "pyarrow>=23.0.1",
+]
