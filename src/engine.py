@@ -21,6 +21,13 @@ logger = logging.getLogger(__name__)
 # `where` filters are handled via NaN masking so they don't block this path.
 _VECTORIZABLE_AGGS = frozenset({"mean", "sum", "count", "min", "max", "std", "nunique"})
 
+# Built-ins that support the windowed entity-by-entity path (O(n), no per-row DataFrame).
+# Requires: built-in aggregation name, window set, no where filter.
+_WINDOWED_VECTORIZABLE = frozenset({"mean", "sum", "count", "min", "max", "std", "nunique"})
+
+# Sentinel object used as dict key for NaN values in the nunique sliding window.
+_NAN_SENTINEL = object()
+
 
 class FeatureEngine:
     """Computes and serves features from event data.
@@ -201,22 +208,34 @@ class FeatureEngine:
         _ckpt_values = os.path.join(checkpoint_dir, "slow_values.parquet") if checkpoint_dir else None
         resume_slow_row = 0
 
-        # Split features into two paths:
-        #   fast — vectorised pandas ops over the whole df at once (no Python loop)
-        #   slow — row-by-row with searchsorted (needed for time-windowed or custom aggs)
+        # Split features into three paths:
+        #   fast     — vectorised pandas ops over the whole df at once (no Python loop)
+        #   windowed — entity-by-entity sliding window, O(n) total (no per-row DataFrame)
+        #   slow     — row-by-row with searchsorted (custom callables, where+window, first/last)
         fast_feats = [
             (fk, feat) for fk, feat in feat_items
             if feat._agg_name in _VECTORIZABLE_AGGS and feat.window is None
         ]
+        windowed_feats = [
+            (fk, feat) for fk, feat in feat_items
+            if feat._agg_name in _WINDOWED_VECTORIZABLE
+            and feat.window is not None
+            and feat.where is None
+        ]
         slow_feats = [
             (fk, feat) for fk, feat in feat_items
             if not (feat._agg_name in _VECTORIZABLE_AGGS and feat.window is None)
+            and not (
+                feat._agg_name in _WINDOWED_VECTORIZABLE
+                and feat.window is not None
+                and feat.where is None
+            )
         ]
 
         if verbose:
             logger.info(
-                "[compute] %d fast features (vectorised), %d slow features (row-by-row)",
-                len(fast_feats), len(slow_feats),
+                "[compute] %d fast features (vectorised), %d windowed features (entity-by-entity), %d slow features (row-by-row)",
+                len(fast_feats), len(windowed_feats), len(slow_feats),
             )
 
         # feature_values: col_name -> numpy array (fast) or list (slow)
@@ -253,12 +272,13 @@ class FeatureEngine:
 
         _t: dict[str, float] = {
             "vectorized": 0.0,   # fast path: _compute_vectorized()
-            "records":    0.0,   # fast path: online upsert + FeatureRecord creation
+            "windowed":   0.0,   # windowed path: _compute_windowed()
+            "records":    0.0,   # fast/windowed path: online upsert + FeatureRecord creation
             "slice":      0.0,   # slow path: searchsorted + DataFrame build
             "where":      0.0,   # slow path: where predicate
             "agg":        0.0,   # slow path: aggregation
             "online":     0.0,   # slow path: online store upsert
-            "offline_io": 0.0,   # Parquet writes (both paths)
+            "offline_io": 0.0,   # Parquet writes (all paths)
         }
 
         def _flush(recs: list) -> None:
@@ -325,6 +345,63 @@ class FeatureEngine:
                 "vectorized=%.3fs records=%.3fs offline_io=%.3fs",
                 elapsed, n_rows / elapsed,
                 _t["vectorized"], _t["records"], _t["offline_io"],
+            )
+
+        # ----------------------------------------------------------------
+        # Windowed path — entity-by-entity sliding window, O(n) per feature
+        # ----------------------------------------------------------------
+        for fk, feat in windowed_feats:
+            col_name = col_names[fk]
+            ek = feat.entity.key
+
+            if ek not in df.columns:
+                logger.warning("feature '%s' skipped: key '%s' not in DataFrame", feat.name, ek)
+                continue
+
+            if verbose:
+                _t0 = time.perf_counter()
+            values = self._compute_windowed(df, feat)
+            if verbose:
+                _t["windowed"] += time.perf_counter() - _t0
+
+            feature_values[col_name] = values
+
+            if verbose:
+                _t0 = time.perf_counter()
+
+            val_series = pd.Series(values, index=df.index)
+            for key_val, last_val in val_series.groupby(df[ek], dropna=False).last().items():
+                if hasattr(key_val, "item"):
+                    key_val = key_val.item()
+                self.online.upsert(feat.entity.name, key_val, feat.name, last_val)
+
+            new_recs = [
+                FeatureRecord(
+                    entity_name=feat.entity.name,
+                    entity_key=ek_v.item() if hasattr(ek_v, "item") else ek_v,
+                    feature_name=feat.name,
+                    value=val,
+                    timestamp=ts,
+                )
+                for ek_v, ts, val in zip(df[ek], df[self.timestamp_col], values)
+            ]
+            records.extend(new_recs)
+
+            if verbose:
+                _t["records"] += time.perf_counter() - _t0
+
+            if len(records) >= _BATCH_SIZE:
+                _flush(records)
+                total_records_written += len(records)
+                records.clear()
+
+        if verbose and windowed_feats:
+            elapsed = time.perf_counter() - start
+            logger.info(
+                "[compute] windowed path done in %.3fs (%.0f rows/s equivalent) | "
+                "windowed=%.3fs offline_io=%.3fs",
+                elapsed, n_rows / elapsed,
+                _t["windowed"], _t["offline_io"],
             )
 
         # ----------------------------------------------------------------
@@ -509,6 +586,60 @@ class FeatureEngine:
 
         result = getattr(df.groupby(ek, dropna=False)[on].expanding(), agg)()
         return result.droplevel(0).sort_index().to_numpy()
+
+    def _compute_windowed(self, df: pd.DataFrame, feat: Feature) -> np.ndarray:
+        """Entity-by-entity O(n) computation for windowed built-in aggregations.
+
+        Uses a sliding-window counter dict for ``nunique`` and pandas
+        ``DataFrame.rolling`` (Cython-backed) for all other built-ins.
+        Neither path allocates a DataFrame per row.
+        """
+        ek = feat.entity.key
+        on = feat.on
+        agg = feat._agg_name
+        ts_col = self.timestamp_col
+        window_td = parse_window(feat.window)
+
+        result = np.empty(len(df), dtype=np.float64)
+
+        if agg == "nunique":
+            window_ns = np.timedelta64(int(window_td.total_seconds() * 1e9), "ns")
+            for _, grp in df.groupby(ek, sort=False, dropna=False):
+                idx = grp.index.to_numpy()
+                ts = grp[ts_col].to_numpy(dtype="datetime64[ns]")
+                # Normalise NA values to a singleton sentinel so they hash correctly.
+                vals_raw = grp[on].to_numpy()
+                vals = [_NAN_SENTINEL if pd.isna(v) else v for v in vals_raw]
+
+                counts: dict = {}
+                left = 0
+                for right in range(len(idx)):
+                    vk = vals[right]
+                    counts[vk] = counts.get(vk, 0) + 1
+                    cutoff = ts[right] - window_ns
+                    while ts[left] < cutoff:
+                        lvk = vals[left]
+                        c = counts[lvk] - 1
+                        if c == 0:
+                            del counts[lvk]
+                        else:
+                            counts[lvk] = c
+                        left += 1
+                    result[idx[right]] = len(counts)
+            return result.astype(np.int64)
+
+        # For count/sum/mean/min/max/std: use pandas rolling (Cython-backed).
+        for _, grp in df.groupby(ek, sort=False, dropna=False):
+            idx = grp.index.to_numpy()
+            rolled = grp.rolling(window=window_td, on=ts_col, min_periods=1)
+            if agg == "count":
+                # ts is never null, so counting it equals counting rows in window.
+                vals = rolled[ts_col].count()
+            else:
+                vals = getattr(rolled[on], agg)()
+            result[idx] = vals.to_numpy()
+
+        return result
 
     # ------------------------------------------------------------------
     # Serving
