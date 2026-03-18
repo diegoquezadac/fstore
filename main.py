@@ -24,7 +24,7 @@ def make_synthetic_df(n: int = 1_000, seed: int = 42) -> pd.DataFrame:
         "attempt_id": np.arange(1, n + 1),
         "user_id":    rng.integers(1, 51, size=n),       # 50 users
         "store_id":   rng.integers(1, 11, size=n),       # 10 stores
-        "card":       rng.choice(["A", "B", "C", "D", ""], size=n),
+        "payment_method": rng.choice(["a", "b", "c", "d", "e"], size=n),
         "price":      rng.uniform(10, 500, size=n).round(2),
         "ts":         [base + timedelta(seconds=int(s)) for s in seconds],
     })
@@ -44,15 +44,16 @@ def main():
     # ---------------------------------------------------------------
     # Define features
     # ---------------------------------------------------------------
-    user_avg_price   = Feature("avg_price",          user,  "mean",    on="price")
-    user_total_spent = Feature("total_spent",         user,  "sum",     on="price")
-    user_tx_count    = Feature("tx_count",            user,  "count")
-    user_cards_2d    = Feature("distinct_cards_2d",   user,  "nunique", on="card", window="2d")
-    user_tx_store1   = Feature("tx_count_store1",     user,  "count",
+    user_avg_price   = Feature("avg_price",              user,  "mean",    on="price")
+    user_total_spent = Feature("total_spent",            user,  "sum",     on="price")
+    user_tx_count    = Feature("tx_count",               user,  "count")
+    user_pm_mode     = Feature("mode_payment_method",    user,  "mode",    on="payment_method")
+    user_pm_mode_30d = Feature("mode_payment_method_30d",user,  "mode",    on="payment_method", window="30d")
+    user_tx_store1   = Feature("tx_count_store1",        user,  "count",
                                where=lambda g: g["store_id"] == 1)
 
-    store_avg_price  = Feature("avg_price",           store, "mean",    on="price")
-    store_total_rev  = Feature("total_revenue",        store, "sum",     on="price")
+    store_avg_price  = Feature("avg_price",              store, "mean",    on="price")
+    store_total_rev  = Feature("total_revenue",          store, "sum",     on="price")
 
     # ---------------------------------------------------------------
     # Example 1: compute() — batch mode  (verbose=True to see timings)
@@ -62,8 +63,8 @@ def main():
     print("=" * 60)
 
     fe = FeatureEngine(timestamp_col="ts")
-    for f in [user_avg_price, user_total_spent, user_tx_count, user_cards_2d,
-              user_tx_store1, store_avg_price, store_total_rev]:
+    for f in [user_avg_price, user_total_spent, user_tx_count, user_pm_mode,
+              user_pm_mode_30d, user_tx_store1, store_avg_price, store_total_rev]:
         fe.register(f)
 
     report = fe.compute(df, verbose=True, log_every=100_000)
@@ -87,7 +88,7 @@ def main():
     shutil.rmtree("offline_store", ignore_errors=True)
 
     fe2 = FeatureEngine(timestamp_col="ts")
-    for f in [user_avg_price, user_tx_count, user_cards_2d]:
+    for f in [user_avg_price, user_tx_count, user_pm_mode, user_pm_mode_30d]:
         fe2.register(f)
 
     df_sorted = df.sort_values("ts").reset_index(drop=True)
