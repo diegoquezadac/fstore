@@ -213,7 +213,16 @@ class OfflineStorage:
         self.flush()
         if not os.path.exists(self.path):
             return pd.DataFrame(columns=["entity_name", "entity_key", "feature_name", "value"])
-        df = pd.read_parquet(self.path, columns=["entity_name", "entity_key", "feature_name", "value", "timestamp"])
+        parts = sorted(
+            os.path.join(self.path, f)
+            for f in os.listdir(self.path)
+            if f.endswith(".parquet")
+        )
+        if not parts:
+            return pd.DataFrame(columns=["entity_name", "entity_key", "feature_name", "value"])
+        # Read each part file individually so pandas handles int/float promotion
+        # on concat, avoiding Arrow's strict cross-file schema unification.
+        df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
         df = df.sort_values("timestamp").groupby(
             ["entity_name", "entity_key", "feature_name"], sort=False
         ).last().reset_index()
