@@ -12,13 +12,46 @@ pip install pandas pyarrow
 
 | Concept | What it is |
 |---|---|
-| `Entity` | The thing you compute features for (e.g. a user, a merchant). Identified by a single key column. |
+| `Entity` | The thing you compute features for (e.g. a user, a product). Identified by a single key column. |
 | `Feature` | A named aggregation over an entity's historical rows, optionally within a time window and/or a row filter. |
 | `FeatureEngine` | Registers features, drives computation, and serves results. Maintains an online store (latest values) and an offline store (full history). |
 
 The engine maintains two backends:
 - **Online** — in-memory dict of the latest feature values per entity key. Fast lookups for real-time scoring.
 - **Offline** — append-only Parquet directory with the full history of every feature computation. Never grows unbounded in RAM.
+
+## Quick start
+
+```python
+from src import Entity, Feature, FeatureEngine
+
+# 1. Define entities
+user    = Entity("user",    key="user_id")
+product = Entity("product", key="product_id")
+
+# 2. Define features
+num_events       = Feature("num_events",       user,    "count")
+total_spent      = Feature("total_spent",      user,    "sum",     on="price_usd",
+                            where=lambda g: g["event_type"] == "purchase")
+distinct_prod_7d = Feature("distinct_prod_7d", user,    "nunique", on="product_id", window="7d")
+num_views_1h     = Feature("num_views_1h",     user,    "count",   window="1h")
+product_views    = Feature("num_views",        product, "count")
+
+# 3. Create engine and register features
+fe = FeatureEngine(timestamp_col="ts")
+fe.register(num_events)
+fe.register(total_spent)
+fe.register(distinct_prod_7d)
+fe.register(num_views_1h)
+fe.register(product_views)
+
+# 4a. Streaming mode — one event at a time
+features = fe.update(row)
+
+# 4b. Batch mode — full DataFrame, enriched in place
+report = fe.compute(df)
+# df["user:num_events"], df["user:total_spent"], df["product:num_views"] are now populated
+```
 
 ## Execution modes
 
@@ -27,12 +60,15 @@ The engine maintains two backends:
 Process one event at a time. Each call appends the row to an internal buffer and recomputes features over that buffer. Use this when data arrives incrementally (e.g. from a message queue or a real-time stream).
 
 ```python
-row = {"user_id": 1, "store_id": 10, "price": 120, "card": "A", "ts": datetime(...)}
+row = {
+    "user_id": 7, "product_id": 42, "category": "electronics",
+    "event_type": "purchase", "price_usd": 199.99, "ts": datetime(...)
+}
 
 features = fe.update(row)
 # {
-#   "user":  {"avg_price": 120.0, "tx_count": 1, "cards_30m": 1},
-#   "store": {"total_revenue": 120}
+#   "user":    {"num_events": 3, "total_spent": 349.97, "num_views_1h": 1},
+#   "product": {"num_views": 5}
 # }
 ```
 
@@ -46,63 +82,44 @@ Process a full DataFrame at once. The engine works directly on the supplied Data
 
 ```python
 report = fe.compute(df)
-# df now has new columns: "user:avg_price", "user:tx_count", "store:total_revenue", ...
+# df now has new columns: "user:num_events", "user:total_spent", "product:num_views", ...
 # report → {
-#   "rows_processed": 6,
-#   "features_computed": 7,
-#   "records_written": 36,
-#   "elapsed_seconds": 0.04,
-#   "feature_columns": ["store:avg_price", "store:total_revenue", "user:avg_price", ...]
+#   "rows_processed": 1000000,
+#   "features_computed": 5,
+#   "records_written": 5000000,
+#   "elapsed_seconds": 12.4,
+#   "feature_columns": ["product:num_views", "user:num_events", ...]
 # }
 ```
 
 Use this for offline experiments, historical replay, and dataset enrichment.
 
-## Quick start
-
-```python
-from src import Entity, Feature, FeatureEngine
-
-# 1. Define entities
-user  = Entity("user",  "user_id")
-store = Entity("store", "store_id")
-
-# 2. Define features
-avg_price = Feature("avg_price",    user,  "mean",    on="price")
-tx_count  = Feature("tx_count",     user,  "count")
-cards_30m = Feature("cards_30m",    user,  "nunique", on="card", window="30m")
-store_rev = Feature("total_revenue",store, "sum",     on="price")
-
-# 3. Create engine and register features
-fe = FeatureEngine(timestamp_col="ts")
-fe.register(avg_price)
-fe.register(tx_count)
-fe.register(cards_30m)
-fe.register(store_rev)
-
-# 4a. Streaming mode — one row at a time
-features = fe.update(row)
-
-# 4b. Batch mode — full DataFrame, enriched in place
-report = fe.compute(df)
-# df["user:avg_price"], df["user:tx_count"], df["store:total_revenue"] are now populated
-```
-
 ## Querying the stores
 
 ```python
 # Latest values (online store)
-fe.get_online_features("user", user_id=1)
-# {"avg_price": 115.0, "tx_count": 4, "cards_30m": 2}
+fe.get_online_features("user", user_id=7)
+# {"num_events": 42, "total_spent": 1320.50, "distinct_prod_7d": 8, ...}
 
 # Full history (offline store, read from Parquet)
-records = fe.get_offline_features("user", feature_name="avg_price", user_id=1)
+records = fe.get_offline_features("user", feature_name="total_spent", user_id=7)
 for rec in records:
     print(rec.timestamp, rec.value)
 
 # Point-in-time query
-records = fe.get_offline_features("user", feature_name="avg_price",
-                                  as_of=datetime(2024, 1, 3), user_id=1)
+records = fe.get_offline_features("user", feature_name="total_spent",
+                                  as_of=datetime(2024, 2, 1), user_id=7)
+```
+
+### Restoring the online store from disk
+
+After a restart, repopulate the in-memory online store from the Parquet backup without recomputing anything:
+
+```python
+fe = FeatureEngine(timestamp_col="ts", offline_path="offline_store")
+# ... register features ...
+n = fe.restore_online_from_offline()
+print(f"Loaded {n} entries")  # ready for real-time lookups immediately
 ```
 
 ## Feature definition
@@ -113,11 +130,11 @@ Feature(name, entity, aggregation, on=None, window=None, where=None)
 
 | Parameter | Type | Description |
 |---|---|---|
-| `name` | `str` | Feature name, e.g. `"avg_price"` |
+| `name` | `str` | Feature name, e.g. `"total_spent"` |
 | `entity` | `Entity` | The entity this feature belongs to |
 | `aggregation` | `str \| Callable` | Built-in name (see table below) or a custom `(DataFrame) -> value` function |
 | `on` | `str \| None` | Column the aggregation reads. Required for all built-ins except `"count"`. For custom callables, used for upfront column validation. |
-| `window` | `str \| None` | Optional time window: `"30m"`, `"2h"`, `"7d"`, etc. Supported units: `s`, `m`, `h`, `d`. |
+| `window` | `str \| None` | Optional time window: `"5m"`, `"1h"`, `"30d"`, etc. Supported units: `s`, `m`, `h`, `d`. |
 | `where` | `Callable \| None` | Optional row filter applied after windowing. Receives the entity DataFrame, must return a boolean Series. |
 
 ### Built-in aggregations
@@ -133,11 +150,12 @@ Feature(name, entity, aggregation, on=None, window=None, where=None)
 | `"std"` | `g[col].std()` |
 | `"first"` | `g[col].iloc[0]` |
 | `"last"` | `g[col].iloc[-1]` |
+| `"mode"` | most frequent value in `g[col]` |
 
 For anything else, pass a callable:
 
 ```python
-Feature("p95_price", user, lambda g: g["price"].quantile(0.95), on="price")
+Feature("p95_price", user, lambda g: g["price_usd"].quantile(0.95), on="price_usd")
 ```
 
 ### Time windows
@@ -145,11 +163,12 @@ Feature("p95_price", user, lambda g: g["price"].quantile(0.95), on="price")
 When `window` is set, only rows within `[timestamp - window, timestamp]` are passed to the aggregation:
 
 ```python
-# Distinct cards used by this user in the last 30 minutes
-cards_30m = Feature("cards_30m", user, "nunique", on="card", window="30m")
+# Distinct products viewed by this user in the last 7 days
+distinct_prod_7d = Feature("distinct_prod_7d", user, "nunique", on="product_id", window="7d")
 
-# Transaction count in the last 7 days
-tx_7d = Feature("tx_7d", user, "count", window="7d")
+# Purchase count in the last hour (burst detection)
+purchases_1h = Feature("purchases_1h", user, "count",
+                        where=lambda g: g["event_type"] == "purchase", window="1h")
 ```
 
 The window string is validated at construction time — an invalid format raises `ValueError` immediately.
@@ -159,13 +178,28 @@ The window string is validated at construction time — an invalid format raises
 When `where` is set, it is applied after windowing, before the aggregation:
 
 ```python
-# Transactions at store 10 only
-tx_store10 = Feature("tx_count_store10", user, "count",
-                     where=lambda g: g["store_id"] == 10)
+# Total spent on purchases only
+total_spent = Feature("total_spent", user, "sum", on="price_usd",
+                       where=lambda g: g["event_type"] == "purchase")
 
-# Average price of high-value transactions in the last 2 days
-avg_high_2d = Feature("avg_high_price_2d", user, "mean", on="price",
-                      window="2d", where=lambda g: g["price"] > 100)
+# High-value purchases in the last 30 days
+big_purchases_30d = Feature("big_purchases_30d", user, "count",
+                             window="30d", where=lambda g: g["price_usd"] > 200)
+```
+
+### Composite entities
+
+Use synthetic key columns to scope features to a combination of entities:
+
+```python
+# User behaviour within a specific product category
+user_in_category = Entity("user_in_category", key="_user_x_category")
+
+# Build the composite key before calling compute()
+df["_user_x_category"] = df["user_id"].astype(str) + "|" + df["category"]
+
+spend_in_category = Feature("total_spent", user_in_category, "sum",
+                             on="price_usd", where=lambda g: g["event_type"] == "purchase")
 ```
 
 ## Crash recovery (batch mode)
@@ -199,7 +233,7 @@ src/
   feature.py        # Feature definition, built-in aggregation registry, window parsing
   engine.py         # FeatureEngine: computation, streaming, batch, and serving
   storage.py        # OnlineStorage (in-memory) + OfflineStorage (Parquet, append-only)
-main.py             # Usage examples
+main.py             # Usage examples (e-commerce clickstream)
 ```
 
 ## Configuration
